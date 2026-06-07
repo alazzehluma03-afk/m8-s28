@@ -11,10 +11,12 @@ Use cross-encoder/ms-marco-MiniLM-L-6-v2 from sentence-transformers.
 from __future__ import annotations
 
 import weaviate
-
+from sentence_transformers import CrossEncoder
 from retrieval_helpers import hybrid_search
 
 CROSS_ENCODER_MODEL = "cross-encoder/ms-marco-MiniLM-L-6-v2"
+
+ce_model = CrossEncoder(CROSS_ENCODER_MODEL)
 
 
 def cross_encoder_rerank(query: str, candidates: list[dict], k_out: int = 5) -> list[str]:
@@ -23,18 +25,25 @@ def cross_encoder_rerank(query: str, candidates: list[dict], k_out: int = 5) -> 
     `candidates` is a list of {"doc_id": str, "text": str} (or a similar
     schema providing the text to score). Score each (query, candidate.text)
     pair; sort descending; return the top-`k_out` doc_id strings.
-
-    Hint:
-        from sentence_transformers import CrossEncoder
-        ce = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
-        pairs = [(query, c["text"]) for c in candidates]
-        scores = ce.predict(pairs)
-        # argsort descending, take top k_out, map back to doc_id
     """
-    # TODO: load CrossEncoder (consider module-level for speed)
-    # TODO: build pairs, score with ce.predict, argsort descending, take top k_out
-    # TODO: return list of doc_id strings
-    raise NotImplementedError("cross_encoder_rerank is not yet implemented")
+    if not candidates:
+        return []
+
+    pairs = [(query, c["text"]) for c in candidates]
+    
+    scores = ce_model.predict(pairs)
+    
+    scored_candidates = []
+    for idx, score in enumerate(scores):
+        scored_candidates.append({
+            "doc_id": candidates[idx]["doc_id"],
+            "score": float(score)
+        })
+    
+    scored_candidates.sort(key=lambda x: x["score"], reverse=True)
+    top_candidates = scored_candidates[:k_out]
+    
+    return [c["doc_id"] for c in top_candidates]
 
 
 def rerank_search(
@@ -52,7 +61,60 @@ def rerank_search(
 
     Return the ordered list of doc_id strings, length <= k_out.
     """
-    # TODO: stage 1: hybrid_search to get k_in candidate doc_ids
-    # TODO: resolve each doc_id back to {"doc_id": ..., "text": ...} via Weaviate query
-    # TODO: stage 3: cross_encoder_rerank(query, candidates, k_out)
-    raise NotImplementedError("rerank_search is not yet implemented")
+    candidate_ids = hybrid_search(client, query, k_in, embedder, alpha=0.5)
+    
+    if not candidate_ids:
+        return []
+
+    class_name = "Document"
+    try:
+        schema = client.schema.get()
+        classes = [c["class"] for c in schema.get("classes", [])]
+        if classes:
+            if "Paragraph" in classes:
+                class_name = "Paragraph"
+            elif "Document" in classes:
+                class_name = "Document"
+            else:
+                class_name = classes[0]
+    except Exception:
+        pass
+
+    candidates = []
+    
+    for doc_id in candidate_ids:
+        try:
+            result = (
+                client.query.get(class_name, ["doc_id", "text"])
+                .with_where({
+                    "path": ["doc_id"],
+                    "operator": "Equal",
+                    "valueString": doc_id
+                })
+                .do()
+            )
+            
+            data = result["data"]["Get"][class_name]
+            if data:
+                candidates.append({
+                    "doc_id": doc_id,
+                    "text": data[0]["text"]
+                })
+                continue
+        except Exception:
+            pass
+
+        try:
+            res = client.data_object.get_by_id(doc_id, class_name=class_name)
+            if res:
+                props = res.get("properties", {})
+                candidates.append({
+                    "doc_id": props.get("doc_id", doc_id),
+                    "text": props.get("text", "")
+                })
+        except Exception:
+            continue
+
+    final_rankings = cross_encoder_rerank(query, candidates, k_out)
+    
+    return final_rankings
